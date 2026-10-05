@@ -48,9 +48,13 @@ Output lines:
 - `steer queued`, `follow_up queued|started`, `ui <dialog> cancelled: <title>`, `retry <n>/<max>: <error>`, `extension error: <error>`.
 - Final line: `settled tN → <run-dir>/final.md` (exit 0) or `aborted tN → …` (exit 2), each followed by the full final reply; or `error …` (exit 1), with Pi's stderr tail when Pi itself exited.
 
-`current:` is printed at startup, turn starts, phase changes, and after about 10 seconds without another output line. A heartbeat reports the last observed phase, not proof of model or tool progress. `last event` measures time since a received Pi RPC record; heartbeats do not reset it. Shorter polls can still return `(no new output)`, which alone is not evidence of a stall. A turn is one model response plus its tool calls, not one user request.
+With stdout connected to a terminal or pipe, `current:` is one transient line, rewritten at startup, turn starts, phase changes, and about once per second. Terminal displays clip progress to one physical row. Ordinary messages clear that line before printing and redraw it afterward; terminal results replace it. For fastexec, use its default cleaned output (`raw: false`) to collapse updates received during a wait to the latest `current:` alongside ordinary messages. Earlier tool responses remain in context; short polls can return no new output, which alone is not evidence of a stall. Other launchers must support carriage-return/erase-line updates to collapse them.
 
-The broker appends the same lines to `<run-dir>/progress.log`. `status <run-dir>` prints one line: `working tN · <phase> · last event <seconds>s ago`, `starting`, `settled`, `aborted`, `interrupted`, or `error`. Live status uses the current turn number; terminal `tN` counts completed turns, so an interrupted turn may not be included. These serve the `&` fallback and post-crash inspection.
+When stdout points to a regular file, such as `> run.out 2>&1`, the broker appends plain text at startup, turn starts, and phase changes, with no periodic refresh lines or redraw controls. Detection uses stdout's file type; a pipe through `tee` remains a pipe to the broker.
+
+`last event` measures time since a received Pi RPC record; display refreshes preserve that timestamp. The displayed phase is the last one observed, not proof of model or tool progress. A turn is one model response plus its tool calls, not one user request.
+
+The broker appends ordinary messages and startup, turn-start, and phase-change snapshots to `<run-dir>/progress.log`, without periodic refreshes or redraw controls. `status <run-dir>` prints one line: `working tN · <phase> · last event <seconds>s ago`, `starting`, `settled`, `aborted`, `interrupted`, or `error`. Live status uses the current turn number; terminal `tN` counts completed turns, so an interrupted turn may not be included. These serve the `&` fallback and post-crash inspection.
 
 ## Steer, follow up, abort
 

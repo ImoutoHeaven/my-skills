@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import test from "node:test";
 
 const broker = fileURLToPath(new URL("./pi-subagent-broker.mjs", import.meta.url));
+// Render the broker's CR/erase-line protocol like a progress-aware launcher.
+const render = (output) => stripVTControlCharacters(output).split("\n").map((line) => line.split("\r").at(-1)).join("\n");
 
 // Mirrors Pi 0.99.1 RPC queue semantics: a prompt starts a run only while idle and
 // needs streamingBehavior while streaming; steer/follow_up records only enqueue.
@@ -112,7 +115,7 @@ async function waitFor(check, timeout = 10000) {
   throw new Error("Timed out waiting for broker");
 }
 
-function setup(context) {
+function setup(context, outputToFile = false) {
   const root = mkdtempSync(join(tmpdir(), "pi-subagent-broker-test-"));
   const piBin = join(root, "fake-pi.cjs");
   writeFileSync(piBin, fakePi);
@@ -124,10 +127,19 @@ function setup(context) {
   });
   const env = { ...process.env, PI_BIN: piBin };
   const start = (...args) => {
-    const child = spawn(process.execPath, [broker, "run", runDir, "--cwd", root, ...args], { env, windowsHide: true });
-    child.output = "";
-    child.stdout.on("data", (chunk) => (child.output += chunk));
-    child.stderr.on("data", (chunk) => (child.output += chunk));
+    const fd = outputToFile ? openSync(join(root, "run.out"), "w") : null;
+    let child;
+    try {
+      child = spawn(process.execPath, [broker, "run", runDir, "--cwd", root, ...args], {
+        env, windowsHide: true, stdio: fd === null ? "pipe" : ["pipe", fd, fd],
+      });
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
+    child.rawOutput = "";
+    Object.defineProperty(child, "output", { get: () => render(child.rawOutput) });
+    child.stdout?.on("data", (chunk) => (child.rawOutput += chunk));
+    child.stderr?.on("data", (chunk) => (child.rawOutput += chunk));
     child.exited = new Promise((done) => child.on("exit", (code) => done(code)));
     children.push(child);
     return child;
@@ -150,7 +162,7 @@ test("a live run applies steering and follow-ups, cancels dialogs, and exits whe
   writeFileSync(join(root, "release"), "");
 
   assert.equal(await run.exited, 0, run.output);
-  const lines = run.output.trim().split(/\r?\n/).filter((line) => !line.startsWith("current:"));
+  const lines = run.output.trim().split(/\r?\n/);
   assert.deepEqual(lines.slice(-4), [
     "[t2] reply:S",
     "[t3] reply:F",
@@ -166,29 +178,72 @@ test("a live run applies steering and follow-ups, cancels dialogs, and exits whe
   assert.match(late.stderr, /No live run/);
 });
 
-test("long silent turns report their phase, active tools, and an honest heartbeat", { timeout: 25000 }, async (context) => {
+test("current is replaced in place, refreshes event age, and leaves durable messages intact", { timeout: 15000 }, async (context) => {
   const { root, runDir, start, cli, status } = setup(context);
   const run = start("progress");
+  const progress = () => readFileSync(join(runDir, "progress.log"), "utf8");
   await waitFor(() => run.output.includes("current: running · turn 1 · thinking"));
-  assert.equal(run.output.match(/current: running · turn 1 · thinking/g).length, 1);
-  assert.match(run.output, /current: running · turn 1 · retrying \(1\/3\)/);
-  assert.match(run.output, /current: running · turn 1 · compacting/);
+  assert.equal(run.output.match(/current:/g).length, 1, run.output);
+  assert.match(progress(), /current: running · turn 1 · retrying \(1\/3\)/);
+  assert.match(progress(), /current: running · turn 1 · compacting/);
   assert.match(status(), /^working t1 · thinking · last event \d+s ago/);
 
   writeFileSync(join(root, "start-tools"), "");
-  await waitFor(() => run.output.includes("tool-calling (edit, checkpoint)"));
-  assert.match(run.output, /current: running · turn 1 · preparing tool call \(edit\)/);
+  await waitFor(() => progress().includes("tool-calling (edit, checkpoint)") && run.output.includes("tool-calling (edit)"));
+  assert.match(progress(), /current: running · turn 1 · preparing tool call \(edit\)/);
   assert.match(status(), /^working t1 · tool-calling \(edit\) · last event \d+s ago/);
-  await waitFor(() => /current: running · turn 1 · tool-calling \(edit\) · last event [1-9]\d*s ago/.test(run.output), 15000);
-  assert.doesNotMatch(run.output, /private-thought|edit-1|checkpoint-1/);
+  const phaseLog = progress();
+  await waitFor(() => /tool-calling \(edit\) · last event [1-9]\d*s ago/.test(run.output), 4000);
+  await waitFor(() => /tool-calling \(edit\) · last event [2-9]\d*s ago/.test(run.output), 4000);
+  assert.equal(run.output.match(/current:/g).length, 1, run.output);
+  assert.equal(progress(), phaseLog, "refreshes must not grow progress.log");
+  assert.doesNotMatch(run.rawOutput, /private-thought|edit-1|checkpoint-1/);
 
   assert.equal(cli("follow-up", runDir, "F").status, 0);
+  await waitFor(() => /tool-calling \(edit\) · last event 0s ago/.test(run.output));
+  assert.match(run.output, /^follow_up queued$/m);
+  assert.equal(run.output.match(/current:/g).length, 1, run.output);
   writeFileSync(join(root, "release"), "");
   assert.equal(await run.exited, 0, run.output);
-  assert.match(run.output, /current: running · turn 2 · waiting for model/);
-  assert.match(run.output, /current: running · turn 2 · streaming reply/);
+  assert.match(progress(), /current: running · turn 2 · waiting for model/);
+  assert.match(progress(), /current: running · turn 2 · streaming reply/);
   assert.equal(readFileSync(join(runDir, "final.md"), "utf8"), "reply:F");
-  assert.equal(readFileSync(join(runDir, "progress.log"), "utf8"), run.output);
+  assert.doesNotMatch(run.output, /current:/);
+  assert.match(run.output, /^\[t1\] reply:progress$/m);
+  assert.match(run.output, /settled t2 .*\nreply:F\n$/);
+  assert.equal(progress().split("\n").filter((line) => !line.startsWith("current:")).join("\n"), run.output);
+});
+
+test("redirected output is plain append-only text without periodic current lines", { timeout: 15000 }, async (context) => {
+  const { root, runDir, start, status } = setup(context, true);
+  const run = start("progress");
+  const output = () => readFileSync(join(root, "run.out"), "utf8");
+  await waitFor(() => output().includes("· thinking ·"));
+  const before = output();
+  const { lastEventAt } = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"));
+  await waitFor(() => Date.now() - lastEventAt >= 2200);
+  assert.equal(output(), before, "silent refreshes must not append to redirected output");
+  assert.match(status(), /^working t1 · thinking · last event [2-9]\d*s ago/);
+  writeFileSync(join(root, "start-tools"), "");
+  writeFileSync(join(root, "release"), "");
+  assert.equal(await run.exited, 0, output());
+  assert.doesNotMatch(output(), /[\r\x1b]/);
+  assert.match(output(), /settled t1 .*\nreply:progress\n$/);
+  assert.equal(readFileSync(join(runDir, "progress.log"), "utf8"), output());
+});
+
+test("terminal current frames disable autowrap only while rendering", (context) => {
+  const { root, runDir } = setup(context);
+  const result = spawnSync(process.execPath, [
+    "--import", "data:text/javascript,process.stdout.isTTY=true",
+    broker, "run", runDir, "--cwd", root, "hello",
+  ], { env: { ...process.env, PI_BIN: join(root, "fake-pi.cjs") }, encoding: "utf8", windowsHide: true, timeout: 10000 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const frames = result.stdout.match(/\x1b\[\?7lcurrent:[^\r\n]*?\x1b\[\?7h/g) || [];
+  assert.ok(frames.length > 0, "terminal progress needs scoped autowrap control");
+  const messages = result.stdout.replace(/\x1b\[\?7lcurrent:[^\r\n]*?\x1b\[\?7h/g, "");
+  assert.doesNotMatch(messages, /current:|\x1b\[\?7[lh]/);
+  assert.match(render(result.stdout), /^reply:hello$/m);
 });
 
 test("a follow-up that starts after the run settles keeps the broker alive", { timeout: 20000 }, async (context) => {
@@ -247,7 +302,7 @@ test("official and npm Windows shims resolve a CLI path containing spaces", (con
       env: { ...process.env, PI_BIN: shim }, encoding: "utf8", windowsHide: true, timeout: 10000,
     });
     assert.equal(result.status, 0, result.stdout + result.stderr);
-    assert.match(result.stdout, /^reply:hello$/m);
+    assert.match(render(result.stdout), /^reply:hello$/m);
   }
 });
 

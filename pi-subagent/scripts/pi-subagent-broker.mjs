@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -243,15 +243,23 @@ async function run(args) {
     state = { ...state, ...changes, updatedAt: new Date().toISOString() };
     writeJson(paths.state, state);
   };
-  let lastOutputAt = Date.now();
+  const redraw = !fstatSync(process.stdout.fd).isFile();
+  const clearCurrent = redraw ? "\r\x1b[2K" : "";
+  let lastCurrentAt = Date.now();
   const say = (line) => {
-    process.stdout.write(`${line}\n`);
+    process.stdout.write(`${clearCurrent}${line}\n`);
     appendFileSync(paths.progress, `${line}\n`);
-    lastOutputAt = Date.now();
+    if (redraw && LIVE.includes(state.status)) reportCurrent(false);
   };
-  const reportCurrent = () => {
+  const reportCurrent = (log = true) => {
     save();
-    say(`current: ${state.status === "working" ? "running" : state.status} · turn ${state.currentTurn} · ${activitySummary(state)}`);
+    const line = `current: ${state.status === "working" ? "running" : state.status} · turn ${state.currentTurn} · ${activitySummary(state)}`;
+    // Keep terminal progress on one physical row, even when tool names exceed its width.
+    const display = process.stdout.isTTY ? `\x1b[?7l${line}\x1b[?7h` : line;
+    if (redraw) process.stdout.write(`${clearCurrent}${display}`);
+    else if (log) process.stdout.write(`${line}\n`);
+    if (log) appendFileSync(paths.progress, `${line}\n`);
+    lastCurrentAt = Date.now();
   };
   const setActivity = (activity) => {
     if (state.activity === activity) return;
@@ -271,6 +279,7 @@ async function run(args) {
     });
   } catch (error) {
     save({ status: "error", lastError: error.message });
+    process.stdout.write(clearCurrent);
     throw error;
   }
   child.stdin.on("error", () => {});
@@ -368,7 +377,7 @@ async function run(args) {
   };
   const inboxTimer = setInterval(() => {
     pollInbox();
-    if (!finished && Date.now() - lastOutputAt >= 10000) reportCurrent();
+    if (!finished && Date.now() - lastCurrentAt >= 1000) reportCurrent(false);
   }, 100);
 
   const handle = (event) => {
