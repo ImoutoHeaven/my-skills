@@ -1,6 +1,6 @@
 ---
 name: colab-attach-ssh
-description: Attach the Google Colab CLI to an already-running runtime, including an unregistered browser session, connect with SSH, and recover from a missing SSH key. Use when operating or troubleshooting an existing Colab VM through SSH.
+description: Attach to an existing Google Colab runtime, operate it over SSH, transfer files directly with the Colab CLI or SCP, and recover a missing SSH key. Use for operating, transferring files to or from, or troubleshooting an existing Colab VM.
 ---
 
 # Attach to an existing Colab runtime via SSH
@@ -36,6 +36,32 @@ colab ssh -s colab-attached --identity "$HOME/.ssh/colab-recovery"
 Replace the example alias and identity with the actual values; do not print or copy private-key contents. The command remains running while the SSH shell is open. Wait for its prompt, issue remote commands in that **same** PTY/session, and read their output before sending another command. Close the shell with `exit` when finished; that does not intentionally stop the runtime. If the local tool represents a PTY as a task, send input and the Enter key to that same task rather than starting a new local shell for each remote command.
 
 SSH uses the Colab runtime-proxy connection; the endpoint identifier is not a public SSH hostname. A notebook's long-running foreground cell may keep its Python kernel busy, while SSH remains a separate channel. Preserve such cells and long-running work; use the application's own restart controls when available.
+
+## Transfer files directly
+
+Use the authenticated Colab connection for local-to-runtime and runtime-to-local transfers. Do not upload files to public temporary storage services as a transfer workaround; use an explicitly authorized external destination only when the user requests one. Before each transfer, verify the alias with `colab sessions` as above: missing aliases can cause some CLI versions to allocate a new runtime. Use the same CLI authentication and config options as the attached session.
+
+For individual files, the CLI supports both directions:
+
+```bash
+colab upload -s colab-attached '/path/to/local-file' '/content/remote-file'
+colab download -s colab-attached '/content/remote-file' '/path/to/local-copy'
+```
+
+Quote paths, use a new temporary destination when overwriting would be unsafe, and verify size and a cryptographic digest on both ends when the result matters. CLI transfers may wait on a busy notebook kernel; do not restart the kernel to unblock them. On Windows Git Bash, prefix these commands with `MSYS_NO_PATHCONV=1` so `/content/...` remains a remote POSIX path. Use the shell's equivalent when Git Bash is not in use.
+
+If an SSH channel is available, OpenSSH `scp` can transfer files over the CLI's proxy without a public server. Disconnect an existing interactive SSH channel first if the runtime allows only one SSH connection; then recheck `colab sessions`. This example uses a temporary host label, the verified alias, and the same identity for the proxy and SSH. Adapt paths and quoting for the local shell; do not use `--rm`.
+
+```bash
+scp -o 'ProxyCommand=colab ssh --proxy-mode -s colab-attached --identity /path/to/private-key' \
+    -o StrictHostKeyChecking=accept-new -i '/path/to/private-key' \
+    '/path/to/local-file' 'root@colab-runtime:/content/remote-file'
+scp -o 'ProxyCommand=colab ssh --proxy-mode -s colab-attached --identity /path/to/private-key' \
+    -o StrictHostKeyChecking=accept-new -i '/path/to/private-key' \
+    'root@colab-runtime:/content/remote-file' '/path/to/local-copy'
+```
+
+`root@colab-runtime` is an SSH host label for the proxy, not the runtime endpoint. On Windows Git Bash, keep local paths and `/content/...` distinct and test path handling; prefer `MSYS_NO_PATHCONV=1` if argument rewriting interferes. For directories, use SCP's recursive option only after checking source and destination; avoid unintended overwrites. On a runtime where the account requires a different SSH user, use that user instead of `root`. Proxy logs and error output may contain connection credentials: inspect them carefully and never paste them into reports.
 
 ## Recover a lost or unusable SSH key
 
